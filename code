@@ -1,0 +1,1201 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# HYBRID SHAP-ATTENTION XAI FOR DISTILBERT SPAM DETECTION
+# Executable Google Colab Notebook
+# Based on Algorithm: Phases I-VI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE I: ENVIRONMENT SETUP & PREPROCESSING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Install dependencies
+!pip install -q transformers datasets accelerate
+!pip install -q torch torchvision torchaudio
+!pip install -q shap lime captum
+!pip install -q matplotlib seaborn scikit-learn scipy
+!pip install -q bertviz
+
+print("✓ All packages installed successfully!")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Import libraries
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import List, Dict
+import time
+from tqdm.auto import tqdm
+
+# PyTorch & Transformers
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    get_linear_schedule_with_warmup
+)
+
+# Scikit-learn
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support,
+    roc_auc_score, confusion_matrix
+)
+
+# XAI Libraries
+import shap
+from lime.lime_text import LimeTextExplainer
+from captum.attr import LayerIntegratedGradients
+
+# Configuration
+warnings.filterwarnings('ignore')
+sns.set_style('whitegrid')
+plt.rcParams['figure.dpi'] = 100
+plt.rcParams['savefig.dpi'] = 300
+
+# Set random seeds for reproducibility
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"\n{'='*80}")
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+print(f"{'='*80}\n")
+
+# Create output directories
+os.makedirs('outputs/models', exist_ok=True)
+os.makedirs('outputs/results', exist_ok=True)
+os.makedirs('outputs/xai/lime', exist_ok=True)
+os.makedirs('outputs/xai/shap', exist_ok=True)
+os.makedirs('outputs/xai/ig', exist_ok=True)
+os.makedirs('outputs/xai/attention', exist_ok=True)
+os.makedirs('outputs/xai/hybrid_shap_attention', exist_ok=True)
+
+print("✓ Environment configured successfully!")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Loading & Preprocessing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SpamDataset(Dataset):
+    """Custom PyTorch Dataset for spam emails"""
+
+    def __init__(self, texts, labels, tokenizer, max_length=128):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = self.labels[idx]
+
+        encoding = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+def load_spam_dataset(filepath: str):
+    """Load and preprocess spam dataset with automatic column detection"""
+
+    print(f"\n{'='*80}")
+    print("LOADING SPAM DATASET")
+    print(f"{'='*80}\n")
+
+    # Try different encodings
+    for encoding in ['utf-8', 'latin-1', 'ISO-8859-1']:
+        try:
+            df = pd.read_csv(filepath, encoding=encoding)
+            print(f"✓ Loaded with {encoding} encoding")
+            break
+        except:
+            continue
+    else:
+        raise ValueError(f"Could not load file {filepath}")
+
+    print(f"\nDataset Info:")
+    print(f"  Shape: {df.shape}")
+    print(f"  Columns: {list(df.columns)}")
+
+    # Auto-detect text column
+    text_col = None
+    for col in df.columns:
+        if col.lower() in ['text', 'message', 'email', 'body', 'content', 'email_text']:
+            text_col = col
+            break
+    if text_col is None:
+        text_col = df.columns[1]
+
+    # Auto-detect label column
+    label_col = None
+    for col in df.columns:
+        if col.lower() in ['label', 'spam', 'class', 'category', 'type']:
+            label_col = col
+            break
+    if label_col is None:
+        label_col = df.columns[0]
+
+    print(f"\nDetected Columns:")
+    print(f"  Text: {text_col}")
+    print(f"  Label: {label_col}")
+
+    # Extract texts
+    X_text = df[text_col].astype(str).values
+
+    # Convert labels to binary
+    if df[label_col].dtype == 'object':
+        spam_labels = {'spam', 'Spam', 'SPAM', '1', 1, True}
+        y = df[label_col].apply(lambda x: 1 if x in spam_labels else 0).values
+    else:
+        y = df[label_col].values
+        if set(y) == {-1, 1}:
+            y = (y + 1) // 2
+        elif set(y) != {0, 1}:
+            y = (y > 0).astype(int)
+
+    # Data quality checks
+    valid_mask = pd.notna(X_text) & (X_text != '') & (X_text != 'nan')
+    X_text = X_text[valid_mask]
+    y = y[valid_mask]
+
+    print(f"\nDataset Statistics:")
+    print(f"  Total samples: {len(X_text):,}")
+    print(f"  Spam emails: {y.sum()} ({y.mean()*100:.2f}%)")
+    print(f"  Ham emails: {len(y) - y.sum()} ({(1-y.mean())*100:.2f}%)")
+    print(f"  Avg text length: {np.mean([len(t) for t in X_text]):.1f} chars")
+
+    # Show samples
+    print(f"\nSample Emails:")
+    spam_idx = np.where(y == 1)[0][0]
+    ham_idx = np.where(y == 0)[0][0]
+    print(f"  SPAM: {X_text[spam_idx][:100]}...")
+    print(f"  HAM: {X_text[ham_idx][:100]}...")
+
+    return X_text, y
+
+# Upload your spam_emails_5k5.csv file to Colab or provide path
+dataset_path = 'spam_emails_5k5.csv'  # Update this path if needed
+
+X_text, y = load_spam_dataset(dataset_path)
+
+# Train-test split (stratified)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_text, y,
+    test_size=0.2,
+    random_state=SEED,
+    stratify=y
+)
+
+# Further split train into train/val
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train,
+    test_size=0.1,
+    random_state=SEED,
+    stratify=y_train
+)
+
+print(f"\nData Split:")
+print(f"  Train: {len(y_train)} ({y_train.sum()} spam, {len(y_train)-y_train.sum()} ham)")
+print(f"  Val: {len(y_val)} ({y_val.sum()} spam, {len(y_val)-y_val.sum()} ham)")
+print(f"  Test: {len(y_test)} ({y_test.sum()} spam, {len(y_test)-y_test.sum()} ham)")
+print(f"\n✓ Dataset loaded and split successfully!\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE II: MODEL TRAINING & EVALUATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Model configuration
+MODEL_NAME = 'distilbert-base-uncased'
+MAX_LENGTH = 128
+BATCH_SIZE = 16
+LEARNING_RATE = 2e-5
+NUM_EPOCHS = 3
+WARMUP_RATIO = 0.1
+
+print(f"\n{'='*80}")
+print("DISTILBERT MODEL TRAINING")
+print(f"{'='*80}\n")
+print(f"Configuration:")
+print(f"  Model: {MODEL_NAME}")
+print(f"  Max length: {MAX_LENGTH}")
+print(f"  Batch size: {BATCH_SIZE}")
+print(f"  Learning rate: {LEARNING_RATE}")
+print(f"  Epochs: {NUM_EPOCHS}")
+print(f"  Device: {device}\n")
+
+# Load tokenizer and model
+print("Loading tokenizer and model...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=2,
+    output_attentions=True,  # Important for attention-based XAI
+    output_hidden_states=True  # Important for embedding analysis
+)
+model.to(device)
+
+print(f"✓ Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters\n")
+
+# Create datasets
+print("Creating PyTorch datasets...")
+train_dataset = SpamDataset(X_train, y_train, tokenizer, MAX_LENGTH)
+val_dataset = SpamDataset(X_val, y_val, tokenizer, MAX_LENGTH)
+test_dataset = SpamDataset(X_test, y_test, tokenizer, MAX_LENGTH)
+
+# Create dataloaders
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+
+print(f"✓ Dataloaders created:")
+print(f"  Train batches: {len(train_loader)}")
+print(f"  Val batches: {len(val_loader)}")
+print(f"  Test batches: {len(test_loader)}\n")
+
+# Optimizer and scheduler
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+total_steps = len(train_loader) * NUM_EPOCHS
+warmup_steps = int(total_steps * WARMUP_RATIO)
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_steps
+)
+
+print(f"Training schedule:")
+print(f"  Total steps: {total_steps}")
+print(f"  Warmup steps: {warmup_steps}\n")
+
+# Training function
+def train_epoch(model, loader, optimizer, scheduler, device):
+    model.train()
+    total_loss = 0
+    predictions = []
+    true_labels = []
+
+    progress_bar = tqdm(loader, desc="Training")
+    for batch in progress_bar:
+        optimizer.zero_grad()
+
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+
+        loss = outputs.loss
+        total_loss += loss.item()
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+
+        preds = torch.argmax(outputs.logits, dim=1)
+        predictions.extend(preds.cpu().numpy())
+        true_labels.extend(labels.cpu().numpy())
+
+        progress_bar.set_postfix({'loss': loss.item()})
+
+    avg_loss = total_loss / len(loader)
+    accuracy = accuracy_score(true_labels, predictions)
+
+    return avg_loss, accuracy
+
+# Evaluation function
+def evaluate(model, loader, device):
+    model.eval()
+    total_loss = 0
+    predictions = []
+    true_labels = []
+    probabilities = []
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Evaluating"):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+
+            total_loss += outputs.loss.item()
+
+            probs = torch.softmax(outputs.logits, dim=1)
+            preds = torch.argmax(outputs.logits, dim=1)
+
+            predictions.extend(preds.cpu().numpy())
+            true_labels.extend(labels.cpu().numpy())
+            probabilities.extend(probs[:, 1].cpu().numpy())
+
+    avg_loss = total_loss / len(loader)
+    accuracy = accuracy_score(true_labels, predictions)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        true_labels, predictions, average='binary', zero_division=0
+    )
+    auc = roc_auc_score(true_labels, probabilities)
+
+    return {
+        'loss': avg_loss,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc,
+        'predictions': predictions,
+        'probabilities': probabilities
+    }
+
+# Training loop
+print("Starting training...\n")
+training_stats = []
+best_val_f1 = 0
+start_time = time.time()
+
+for epoch in range(NUM_EPOCHS):
+    print(f"{'='*80}")
+    print(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
+    print(f"{'='*80}\n")
+
+    # Train
+    train_loss, train_acc = train_epoch(model, train_loader, optimizer, scheduler, device)
+
+    # Validate
+    val_results = evaluate(model, val_loader, device)
+
+    # Log results
+    stats = {
+        'epoch': epoch + 1,
+        'train_loss': train_loss,
+        'train_accuracy': train_acc,
+        'val_loss': val_results['loss'],
+        'val_accuracy': val_results['accuracy'],
+        'val_precision': val_results['precision'],
+        'val_recall': val_results['recall'],
+        'val_f1': val_results['f1'],
+        'val_auc': val_results['auc']
+    }
+    training_stats.append(stats)
+
+    print(f"\nEpoch {epoch + 1} Results:")
+    print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+    print(f"  Val Loss: {val_results['loss']:.4f} | Val Acc: {val_results['accuracy']:.4f}")
+    print(f"  Val Precision: {val_results['precision']:.4f} | Val Recall: {val_results['recall']:.4f}")
+    print(f"  Val F1: {val_results['f1']:.4f} | Val AUC: {val_results['auc']:.4f}")
+
+    # Save best model
+    if val_results['f1'] > best_val_f1:
+        best_val_f1 = val_results['f1']
+        torch.save(model.state_dict(), 'outputs/models/best_model.pt')
+        tokenizer.save_pretrained('outputs/models/tokenizer')
+        print(f"  ✓ Best model saved (F1: {best_val_f1:.4f})")
+    print()
+
+training_time = time.time() - start_time
+print(f"Training complete in {training_time:.2f}s ({training_time/60:.2f} min)\n")
+
+# Load best model for testing
+model.load_state_dict(torch.load('outputs/models/best_model.pt'))
+print("Evaluating on test set...")
+test_results = evaluate(model, test_loader, device)
+
+print(f"\n{'='*80}")
+print("FINAL TEST RESULTS")
+print(f"{'='*80}")
+print(f"  Accuracy: {test_results['accuracy']:.4f} ({test_results['accuracy']*100:.2f}%)")
+print(f"  Precision: {test_results['precision']:.4f} ({test_results['precision']*100:.2f}%)")
+print(f"  Recall: {test_results['recall']:.4f} ({test_results['recall']*100:.2f}%)")
+print(f"  F1-Score: {test_results['f1']:.4f} ({test_results['f1']*100:.2f}%)")
+print(f"  AUC-ROC: {test_results['auc']:.4f} ({test_results['auc']*100:.2f}%)")
+print(f"{'='*80}\n")
+
+# Save results
+with open('outputs/results/test_results.json', 'w') as f:
+    json.dump({k: v for k, v in test_results.items()
+               if k not in ['predictions', 'probabilities']}, f, indent=2)
+
+print("✓ Model training and evaluation complete!\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE III: XAI SAMPLE SELECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print(f"{'='*80}")
+print("XAI SAMPLE SELECTION")
+print(f"{'='*80}\n")
+
+def select_diverse_samples(X, y, n_samples=10):
+    """Select diverse samples for XAI analysis"""
+    spam_indices = np.where(y == 1)[0]
+    ham_indices = np.where(y == 0)[0]
+
+    # Get correct and incorrect predictions
+    y_pred = np.array(test_results['predictions'])
+    correct_spam = spam_indices[y_pred[spam_indices] == 1][:n_samples//4]
+    incorrect_spam = spam_indices[y_pred[spam_indices] == 0][:n_samples//4]
+    correct_ham = ham_indices[y_pred[ham_indices] == 0][:n_samples//4]
+    incorrect_ham = ham_indices[y_pred[ham_indices] == 1][:n_samples//4]
+
+    selected = np.concatenate([
+        correct_spam, incorrect_spam, correct_ham, incorrect_ham
+    ])
+
+    return selected[:n_samples]
+
+xai_sample_indices = select_diverse_samples(X_test, y_test, n_samples=10)
+print(f"✓ Selected {len(xai_sample_indices)} diverse samples for XAI analysis\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE IV: BASELINE XAI METHODS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print(f"{'='*80}")
+print("BASELINE XAI METHODS")
+print(f"{'='*80}\n")
+
+# Helper function for predictions
+def predict_proba_batch(texts: List[str]) -> np.ndarray:
+    """Batch prediction function for XAI methods"""
+    model.eval()
+
+    if isinstance(texts, str):
+        texts = [texts]
+
+    if isinstance(texts, np.ndarray):
+        texts = texts.tolist()
+
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        padding=True,
+        max_length=MAX_LENGTH,
+        return_tensors='pt'
+    )
+
+    input_ids = encodings['input_ids'].to(device)
+    attention_mask = encodings['attention_mask'].to(device)
+
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        probs = torch.softmax(outputs.logits, dim=1)
+
+    return probs.cpu().numpy()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.1 LIME Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+print(f"\n{'-'*80}")
+print("LIME Analysis")
+print(f"{'-'*80}\n")
+
+lime_explainer = LimeTextExplainer(
+    class_names=['Ham', 'Spam'],
+    bow=False,
+    split_expression=r'\W+'
+)
+
+lime_results = []
+
+for i, idx in enumerate(xai_sample_indices[:5]):  # First 5 for speed
+    text = X_test[idx]
+    true_label = y_test[idx]
+
+    print(f"Analyzing sample {i+1}/5...")
+    print(f"  Text: {text[:80]}...")
+    print(f"  True label: {'Spam' if true_label == 1 else 'Ham'}")
+
+    pred_proba = predict_proba_batch(text)[0]
+    pred_label = int(np.argmax(pred_proba))
+
+    exp = lime_explainer.explain_instance(
+        text,
+        predict_proba_batch,
+        num_features=15,
+        num_samples=500,
+        labels=[pred_label]
+    )
+
+    # Save visualization
+    fig = exp.as_pyplot_figure(label=pred_label)
+    plt.title(f"LIME | True: {'Spam' if true_label==1 else 'Ham'}, " +
+              f"Pred: {'Spam' if pred_label==1 else 'Ham'} ({pred_proba[pred_label]:.2f})")
+    plt.tight_layout()
+    plt.savefig(f'outputs/xai/lime/sample_{i+1}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    lime_results.append({
+        'index': int(idx),
+        'text': text[:200],
+        'true_label': int(true_label),
+        'pred_label': pred_label,
+        'confidence': float(pred_proba[pred_label]),
+        'top_features': exp.as_list(label=pred_label)[:10]
+    })
+
+print(f"\n✓ LIME analysis complete for {len(lime_results)} samples\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.2 Integrated Gradients
+# ─────────────────────────────────────────────────────────────────────────────
+
+print(f"{'-'*80}")
+print("Integrated Gradients")
+print(f"{'-'*80}\n")
+
+# Wrapper for Captum
+def forward_func(input_ids, attention_mask):
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    return outputs.logits
+
+# Use LayerIntegratedGradients to attribute to embeddings
+lig = LayerIntegratedGradients(forward_func, model.distilbert.embeddings)
+
+ig_results = []
+
+for i, idx in enumerate(xai_sample_indices[:5]):
+    text = X_test[idx]
+    true_label = y_test[idx]
+
+    print(f"Analyzing sample {i+1}/5...")
+
+    # Tokenize
+    encoding = tokenizer(
+        text,
+        truncation=True,
+        padding='max_length',
+        max_length=MAX_LENGTH,
+        return_tensors='pt'
+    )
+
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
+
+    # Calculate attributions
+    baseline_ids = torch.zeros_like(input_ids)
+
+    # Attribute to embeddings
+    attributions, delta = lig.attribute(
+        inputs=input_ids,
+        baselines=baseline_ids,
+        additional_forward_args=(attention_mask,),
+        target=1,  # Spam class
+        return_convergence_delta=True,
+        n_steps=50
+    )
+
+    # Get token-level attributions
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+
+    # Sum across embedding dimension to get one score per token
+    attr_sum = attributions.sum(dim=-1).squeeze(0)
+    attr_sum = attr_sum / torch.norm(attr_sum)
+    attr_sum = attr_sum.cpu().detach().numpy()
+
+    # Visualize top attributions
+    valid_indices = [i for i, t in enumerate(tokens) if t not in ['[PAD]', '[CLS]', '[SEP]']]
+    valid_tokens = [tokens[i] for i in valid_indices]
+    valid_attrs = [attr_sum[i] for i in valid_indices]
+
+    # Sort by absolute attribution
+    sorted_indices = np.argsort(np.abs(valid_attrs))[-15:]
+    top_tokens = [valid_tokens[i] for i in sorted_indices]
+    top_attrs = [valid_attrs[i] for i in sorted_indices]
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = ['red' if a < 0 else 'green' for a in top_attrs]
+    ax.barh(range(len(top_tokens)), top_attrs, color=colors, alpha=0.7)
+    ax.set_yticks(range(len(top_tokens)))
+    ax.set_yticklabels(top_tokens)
+    ax.set_xlabel('Attribution Score', fontsize=12)
+    ax.set_title(f"Integrated Gradients - Top 15 Tokens\n" +
+                 f"True: {'Spam' if true_label==1 else 'Ham'}",
+                 fontsize=12, fontweight='bold')
+    ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
+    plt.tight_layout()
+    plt.savefig(f'outputs/xai/ig/sample_{i+1}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    ig_results.append({
+        'index': int(idx),
+        'text': text[:200],
+        'true_label': int(true_label),
+        'top_tokens': list(zip(top_tokens, [float(a) for a in top_attrs]))
+    })
+
+print(f"\n✓ Integrated Gradients analysis complete for {len(ig_results)} samples\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.3 Attention Visualization
+# ─────────────────────────────────────────────────────────────────────────────
+
+print(f"{'-'*80}")
+print("Attention Visualization")
+print(f"{'-'*80}\n")
+
+model.eval()
+attention_results = []
+
+for i, idx in enumerate(xai_sample_indices[:3]):
+    text = X_test[idx]
+    true_label = y_test[idx]
+
+    print(f"Visualizing attention for sample {i+1}/3...")
+
+    # Tokenize
+    encoding = tokenizer(
+        text,
+        truncation=True,
+        padding='max_length',
+        max_length=MAX_LENGTH,
+        return_tensors='pt'
+    )
+
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_attentions=True
+        )
+
+    # Get attention weights (last layer, average over heads)
+    attention = outputs.attentions[-1]  # Last layer
+    attention = attention.mean(dim=1)  # Average over heads
+    attention = attention[0].cpu().numpy()  # First (only) sample
+
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+
+    # Plot attention heatmap
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # Trim to actual tokens (remove padding)
+    seq_len = attention_mask.sum().item()
+    attention_trimmed = attention[:seq_len, :seq_len]
+    tokens_trimmed = tokens[:seq_len]
+
+    im = ax.imshow(attention_trimmed, cmap='viridis', aspect='auto')
+    ax.set_xticks(range(len(tokens_trimmed)))
+    ax.set_yticks(range(len(tokens_trimmed)))
+    ax.set_xticklabels(tokens_trimmed, rotation=90, fontsize=8)
+    ax.set_yticklabels(tokens_trimmed, fontsize=8)
+    ax.set_xlabel('Key Tokens', fontsize=12)
+    ax.set_ylabel('Query Tokens', fontsize=12)
+    ax.set_title(f"Attention Heatmap (Last Layer, Avg Heads)\n" +
+                 f"True: {'Spam' if true_label==1 else 'Ham'}",
+                 fontsize=12, fontweight='bold')
+    plt.colorbar(im, ax=ax, label='Attention Weight')
+    plt.tight_layout()
+    plt.savefig(f'outputs/xai/attention/sample_{i+1}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    attention_results.append({
+        'index': int(idx),
+        'text': text[:200],
+        'true_label': int(true_label),
+        'attention_shape': attention_trimmed.shape
+    })
+
+print(f"\n✓ Attention visualization complete for {len(attention_results)} samples\n")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE V: HYBRID SHAP-ATTENTION FRAMEWORK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print(f"\n{'='*80}")
+print("NOVEL METHOD: HYBRID SHAP-ATTENTION FRAMEWORK")
+print(f"{'='*80}\n")
+
+class HybridSHAPAttention:
+    """
+    Novel XAI method combining SHAP values with attention mechanisms
+
+    This approach provides multi-level interpretability by:
+    1. Computing token-level SHAP importance
+    2. Extracting multi-layer attention weights
+    3. Fusing both signals for hierarchical explanations
+    """
+
+    def __init__(self, model, tokenizer, device):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.model.eval()
+
+    def get_attention_weights(self, text: str, max_length: int = 128):
+        """
+        Extract attention weights from all layers
+
+        Returns:
+            tokens: List of tokens
+            attention_weights: Dict mapping layer -> attention matrix
+        """
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=max_length,
+            return_tensors='pt'
+        )
+
+        input_ids = encoding['input_ids'].to(self.device)
+        attention_mask = encoding['attention_mask'].to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True
+            )
+
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
+        seq_len = attention_mask.sum().item()
+
+        # Extract and average attention over heads for each layer
+        attention_weights = {}
+        for layer_idx, attention in enumerate(outputs.attentions):
+            # attention shape: (batch, heads, seq_len, seq_len)
+            attention_avg = attention[0].mean(dim=0)  # Average over heads
+            attention_weights[f'layer_{layer_idx}'] = attention_avg[:seq_len, :seq_len].cpu().numpy()
+
+        return tokens[:seq_len], attention_weights
+
+    def compute_shap_importance(self, text: str, target_class: int = 1):
+        """
+        Compute token-level SHAP importance using Integrated Gradients
+        as proxy for SHAP (which is computationally expensive)
+
+        Returns:
+            tokens: List of tokens
+            shap_values: Array of SHAP importance scores
+        """
+        encoding = self.tokenizer(
+            text,
+            truncation=True,
+            padding='max_length',
+            max_length=128,
+            return_tensors='pt'
+        )
+
+        input_ids = encoding['input_ids'].to(self.device)
+        attention_mask = encoding['attention_mask'].to(self.device)
+
+        # Use LayerIntegratedGradients on embeddings to handle discrete inputs
+        def forward_func(input_ids, attention_mask):
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            return outputs.logits
+
+        # Target the embedding layer
+        lig = LayerIntegratedGradients(forward_func, self.model.distilbert.embeddings)
+
+        baseline_ids = torch.zeros_like(input_ids)
+
+        attributions = lig.attribute(
+            inputs=input_ids,
+            baselines=baseline_ids,
+            additional_forward_args=(attention_mask,),
+            target=target_class,
+            n_steps=50
+        )
+
+        # Sum attributions across embedding dimension
+        attr_sum = attributions.sum(dim=-1).squeeze(0)
+        attr_sum = attr_sum.cpu().detach().numpy()
+
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
+        seq_len = attention_mask.sum().item()
+
+        return tokens[:seq_len], attr_sum[:seq_len]
+
+    def compute_hybrid_scores(self, text: str, target_class: int = 1):
+        """
+        Compute hybrid SHAP-Attention scores
+
+        Formula: HybridScore(token_i) = SHAP(token_i) × Σ_j Attention(i, j)
+
+        This captures both:
+        - Token importance (SHAP)
+        - Contextual influence (Attention)
+
+        Returns:
+            tokens: List of tokens
+            hybrid_scores: Dict with scores for each layer
+            shap_values: Raw SHAP scores
+            attention_weights: Raw attention weights
+        """
+        # Get SHAP importance
+        tokens, shap_values = self.compute_shap_importance(text, target_class)
+
+        # Get attention weights
+        tokens_att, attention_weights = self.get_attention_weights(text)
+
+        # Ensure same length
+        min_len = min(len(tokens), len(tokens_att))
+        tokens = tokens[:min_len]
+        shap_values = shap_values[:min_len]
+
+        # Compute hybrid scores for each layer
+        hybrid_scores = {}
+        for layer_name, attention_matrix in attention_weights.items():
+            # Sum attention weights for each token (row-wise)
+            attention_sum = attention_matrix.sum(axis=1)[:min_len]
+
+            # Normalize
+            attention_sum = attention_sum / (attention_sum.sum() + 1e-10)
+            shap_norm = shap_values / (np.abs(shap_values).sum() + 1e-10)
+
+            # Hybrid score: element-wise product
+            hybrid = shap_norm * attention_sum
+            hybrid_scores[layer_name] = hybrid
+
+        return tokens, hybrid_scores, shap_values, attention_weights
+
+    def visualize_hybrid(self, text: str, target_class: int = 1, save_path: str = None):
+        """
+        Create comprehensive visualization of hybrid SHAP-Attention
+        """
+        tokens, hybrid_scores, shap_values, attention_weights = self.compute_hybrid_scores(
+            text, target_class
+        )
+
+        # Filter out special tokens for visualization
+        valid_indices = [i for i, t in enumerate(tokens) if t not in ['[PAD]', '[CLS]', '[SEP]']]
+        if len(valid_indices) == 0:
+            return None
+
+        tokens_filtered = [tokens[i] for i in valid_indices]
+        shap_filtered = [shap_values[i] for i in valid_indices]
+
+        # Create figure with subplots
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        fig.suptitle(f"Hybrid SHAP-Attention Analysis\n{text[:80]}...",
+                     fontsize=14, fontweight='bold')
+
+        # 1. SHAP values
+        ax = axes[0, 0]
+        colors = ['red' if s < 0 else 'green' for s in shap_filtered]
+        ax.barh(range(len(tokens_filtered)), shap_filtered, color=colors, alpha=0.7)
+        ax.set_yticks(range(len(tokens_filtered)))
+        ax.set_yticklabels(tokens_filtered, fontsize=8)
+        ax.set_xlabel('SHAP Value')
+        ax.set_title('A) SHAP Importance', fontweight='bold')
+        ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
+
+        # 2. Attention heatmap (last layer)
+        ax = axes[0, 1]
+        last_layer = list(attention_weights.keys())[-1]
+        attention_last = attention_weights[last_layer]
+        im = ax.imshow(attention_last, cmap='viridis', aspect='auto')
+        ax.set_title(f'B) Attention Heatmap ({last_layer})', fontweight='bold')
+        ax.set_xlabel('Key Tokens')
+        ax.set_ylabel('Query Tokens')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        # 3-6. Hybrid scores for different layers
+        layer_names = list(hybrid_scores.keys())
+        selected_layers = [layer_names[0], layer_names[len(layer_names)//2],
+                          layer_names[-2], layer_names[-1]]
+
+        for idx, layer_name in enumerate(selected_layers):
+            ax = axes[(idx+2)//2, (idx+2)%2]
+            hybrid_filtered = [hybrid_scores[layer_name][i] for i in valid_indices]
+
+            colors = ['purple' if h > 0 else 'orange' for h in hybrid_filtered]
+            ax.barh(range(len(tokens_filtered)), hybrid_filtered, color=colors, alpha=0.7)
+            ax.set_yticks(range(len(tokens_filtered)))
+            ax.set_yticklabels(tokens_filtered, fontsize=8)
+            ax.set_xlabel('Hybrid Score')
+            ax.set_title(f"{chr(67+idx)}) Hybrid ({layer_name})", fontweight='bold')
+            ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
+        return {
+            'tokens': tokens_filtered,
+            'shap_values': shap_filtered,
+            'hybrid_scores': {k: [v[i] for i in valid_indices]
+                            for k, v in hybrid_scores.items()}
+        }
+
+# Initialize hybrid explainer
+print("Initializing Hybrid SHAP-Attention Explainer...\n")
+hybrid_explainer = HybridSHAPAttention(model, tokenizer, device)
+
+# Analyze samples
+print("Analyzing samples with Hybrid SHAP-Attention...\n")
+hybrid_results = []
+
+for i, idx in enumerate(xai_sample_indices[:5]):
+    text = X_test[idx]
+    true_label = y_test[idx]
+
+    print(f"Sample {i+1}/5:")
+    print(f"  Text: {text[:80]}...")
+    print(f"  True label: {'Spam' if true_label == 1 else 'Ham'}")
+
+    result = hybrid_explainer.visualize_hybrid(
+        text,
+        target_class=1,
+        save_path=f'outputs/xai/hybrid_shap_attention/sample_{i+1}.png'
+    )
+
+    if result:
+        hybrid_results.append({
+            'index': int(idx),
+            'text': text[:200],
+            'true_label': int(true_label),
+            'tokens': result['tokens'],
+            'shap_values': [float(v) for v in result['shap_values']],
+            'hybrid_scores': {k: [float(v) for v in vals]
+                            for k, vals in result['hybrid_scores'].items()}
+        })
+    print()
+
+# Save results
+with open('outputs/results/hybrid_shap_attention_results.json', 'w') as f:
+    json.dump(hybrid_results, f, indent=2)
+
+print(f"{'='*80}")
+print("HYBRID SHAP-ATTENTION ANALYSIS COMPLETE")
+print(f"{'='*80}\n")
+print(f"Key Findings:")
+print(f"  - Analyzed {len(hybrid_results)} samples")
+print(f"  - Generated multi-layer hybrid explanations")
+print(f"  - Visualizations saved to outputs/xai/hybrid_shap_attention/")
+print(f"\nInnovation: This method addresses the 'Attention is not Explanation' debate")
+print(f"by combining attention with gradient-based attributions.")
+print(f"\n{'='*80}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE VI: OUTPUT ARTIFACTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print(f"\n{'='*80}")
+print("OUTPUT SUMMARY")
+print(f"{'='*80}\n")
+print(f"Generated artifacts:")
+print(f"  ✓ Trained model: outputs/models/best_model.pt")
+print(f"  ✓ Test metrics: outputs/results/test_results.json")
+print(f"  ✓ LIME explanations: outputs/xai/lime/")
+print(f"  ✓ Integrated Gradients: outputs/xai/ig/")
+print(f"  ✓ Attention visualizations: outputs/xai/attention/")
+print(f"  ✓ Hybrid SHAP-Attention: outputs/xai/hybrid_shap_attention/")
+print(f"\n{'='*80}\n")
+print("✅ ALL PHASES COMPLETE!")
+print(f"{'='*80}\n")
+
+
+
+
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+# Aggregate SHAP values from all samples in hybrid_shap_attention_results
+aggr_hybrid_shap_scores = defaultdict(float)
+
+for sample_result in hybrid_shap_attention_results:
+    tokens = sample_result['tokens']
+    shap_values = sample_result['shap_values']
+
+    for token, shap_val in zip(tokens, shap_values):
+        # Aggregate absolute SHAP values for overall importance
+        if token not in ['[CLS]', '[SEP]', '[PAD]', '', ' ']:
+            aggr_hybrid_shap_scores[token] += abs(float(shap_val))
+
+# Sort tokens by their aggregated SHAP importance
+sorted_aggr_hybrid_shap = sorted(aggr_hybrid_shap_scores.items(), key=lambda item: item[1], reverse=True)
+
+# Select top N features for plotting
+num_top_aggr_features = 20  # You can adjust N
+top_aggr_features = sorted_aggr_hybrid_shap[:num_top_aggr_features]
+aggr_tokens = [item[0] for item in top_aggr_features]
+aggr_scores = [item[1] for item in top_aggr_features]
+
+print(f"Top {num_top_aggr_features} influential tokens across all Hybrid SHAP-Attention samples:")
+for token, score in top_aggr_features:
+    print(f"  {token}: {score:.4f}")
+
+# Create the plot
+plt.figure(figsize=(10, 8))
+sns.barplot(x=aggr_scores, y=aggr_tokens, palette='magma')
+plt.xlabel('Aggregated Absolute Hybrid SHAP Value', fontsize=12)
+plt.ylabel('Token', fontsize=12)
+plt.title(f'Top {num_top_aggr_features} Influential Tokens from Hybrid SHAP-Attention Samples', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plot_path = 'outputs/xai/top_hybrid_shap_tokens_aggregated.png'
+plt.savefig(plot_path, dpi=300)
+plt.show()
+
+print(f"\nVisualization saved to {plot_path}")
+
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Select the top N features for plotting
+num_top_features = 20
+top_features = sorted_global_shap[:num_top_features]
+tokens = [item[0] for item in top_features]
+scores = [item[1] for item in top_features]
+
+# Create the plot
+plt.figure(figsize=(10, 8))
+sns.barplot(x=scores, y=tokens, palette='viridis')
+plt.xlabel('Aggregated Absolute SHAP Value (Global Importance)', fontsize=12)
+plt.ylabel('Token', fontsize=12)
+plt.title('Global SHAP Feature Importance - Top Tokens', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('outputs/xai/global_shap_importance.png', dpi=300)
+plt.show()
+
+print(f"\nGlobal SHAP importance plot saved to outputs/xai/global_shap_importance.png")
+from IPython.display import Image, display
+
+image_path = 'outputs/xai/hybrid_shap_attention/first_xai_sample_analysis.png'
+display(Image(filename=image_path))
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Melt the DataFrame for seaborn grouped bar plot
+melted_df = filtered_comparison_df.melt(id_vars='Token', var_name='SHAP_Type', value_name='Importance')
+
+# Set figure size based on number of tokens
+num_tokens = len(filtered_comparison_df)
+plt.figure(figsize=(12, max(6, num_tokens * 0.4)))
+
+sns.barplot(x='Importance', y='Token', hue='SHAP_Type', data=melted_df, palette='viridis')
+
+plt.xlabel('Absolute SHAP Importance', fontsize=12)
+plt.ylabel('Token', fontsize=12)
+plt.title('Local vs. Global SHAP Importance for First XAI Sample', fontsize=14, fontweight='bold')
+plt.legend(title='SHAP Type')
+plt.tight_layout()
+plt.savefig('outputs/xai/local_vs_global_shap.png', dpi=300)
+plt.show()
+
+print(f"Comparative SHAP visualization saved to outputs/xai/local_vs_global_shap.png")
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# Re-establish hybrid_analysis_result for this cell
+# This assumes xai_sample_indices and X_test are available from prior cells.
+sample_idx = xai_sample_indices[0]
+first_xai_sample_text = X_test[sample_idx]
+
+# Re-run visualize_hybrid to get the result object for this cell.
+# Provide save_path to prevent plt.show() from blocking, as the plot is re-saved later.
+hybrid_analysis_result = hybrid_explainer.visualize_hybrid(
+    first_xai_sample_text,
+    target_class=1, # Assuming target class for spam is 1
+    save_path='outputs/xai/hybrid_shap_attention/first_xai_sample_analysis.png' # Re-saving to the same file
+)
+
+# Retrieve local tokens and SHAP values
+local_tokens = hybrid_analysis_result['tokens']
+local_shap_values = hybrid_analysis_result['shap_values']
+
+# Create a global SHAP map from sorted_global_shap
+global_shap_map = {token: score for token, score in sorted_global_shap}
+
+# Map local tokens to global SHAP scores
+mapped_global_shap_scores = []
+for token in local_tokens:
+    global_score = global_shap_map.get(token, 0) # Assign 0 if token not found globally
+    mapped_global_shap_scores.append(global_score)
+
+# Calculate absolute local SHAP values for comparison with global (which is already absolute)
+absolute_local_shap_values = [abs(val) for val in local_shap_values]
+
+# Create a DataFrame
+comparison_df = pd.DataFrame({
+    'Token': local_tokens,
+    'Local_SHAP': absolute_local_shap_values,
+    'Global_SHAP': mapped_global_shap_scores
+})
+
+# Filter out special tokens and tokens with negligible importance
+special_tokens = ['[CLS]', '[SEP]', '[PAD]', '', ' ']
+min_importance_threshold = 1e-4
+filtered_comparison_df = comparison_df[
+    (~comparison_df['Token'].isin(special_tokens)) &
+    ((comparison_df['Local_SHAP'] > min_importance_threshold) |
+     (comparison_df['Global_SHAP'] > min_importance_threshold))
+]
+
+# Sort by local SHAP for better visualization if needed, or by global
+filtered_comparison_df = filtered_comparison_df.sort_values(by='Local_SHAP', ascending=False).reset_index(drop=True)
+
+# Melt the DataFrame for seaborn grouped bar plot
+melted_df = filtered_comparison_df.melt(id_vars='Token', var_name='SHAP_Type', value_name='Importance')
+
+# Set figure size based on number of tokens
+num_tokens = len(filtered_comparison_df)
+plt.figure(figsize=(12, max(6, num_tokens * 0.4)))
+
+sns.barplot(x='Importance', y='Token', hue='SHAP_Type', data=melted_df, palette='viridis')
+
+plt.xlabel('Absolute SHAP Importance', fontsize=12)
+plt.ylabel('Token', fontsize=12)
+plt.title('Local vs. Global SHAP Importance for First XAI Sample', fontsize=14, fontweight='bold')
+plt.legend(title='SHAP Type')
+plt.tight_layout()
+plt.savefig('outputs/xai/local_vs_global_shap.png', dpi=300)
+plt.show()
+
+print(f"Comparative SHAP visualization saved to outputs/xai/local_vs_global_shap.png")
+
+
+
+---------------------------------------------------------------------------------
+
+
+
